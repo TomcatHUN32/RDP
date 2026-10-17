@@ -3,29 +3,33 @@ name: Windows 2022
 on:
   workflow_dispatch:
 
+permissions:
+  id-token: write
+
 jobs:
   build:
     runs-on: windows-2022
     timeout-minutes: 350
 
     steps:
-      - name: Install ngrok
-        shell: powershell
-        run: |
-          $url = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
-          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\ngrok.zip"
-          Expand-Archive "$env:TEMP\ngrok.zip" -DestinationPath "$env:USERPROFILE\ngrok" -Force
 
-      - name: Configure ngrok
-        shell: powershell
-        env:
-          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
-        run: |
-          & "$env:USERPROFILE\ngrok\ngrok.exe" config add-authtoken "$env:NGROK_AUTH_TOKEN"
+      # ==========================================
+      # 1. TAILSCALE
+      # ==========================================
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          version: latest
 
+      # ==========================================
+      # 2. ENABLE REMOTE DESKTOP
+      # ==========================================
       - name: Enable Remote Desktop
         shell: powershell
         run: |
+          Write-Host "Enabling Remote Desktop..."
+
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' `
@@ -36,74 +40,138 @@ jobs:
             -Name 'UserAuthentication' `
             -Value 1
 
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Get-NetFirewallRule `
+            -DisplayGroup 'Remote Desktop' |
+            Enable-NetFirewallRule
 
-          Restart-Service -Name TermService -Force
+          Write-Host "Remote Desktop enabled."
 
+      # ==========================================
+      # 3. CREATE RDP USER
+      # ==========================================
       - name: Create RDP user
         shell: powershell
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          if (-not $env:RDP_PASSWORD) {
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
             Write-Error "RDP_PASSWORD secret is missing."
             exit 1
           }
 
-          $password = ConvertTo-SecureString `
-            $env:RDP_PASSWORD `
-            -AsPlainText `
-            -Force
+          Write-Host "Creating RDP user..."
 
-          New-LocalUser `
-            -Name 'RDP' `
-            -Password $password `
-            -AccountNeverExpires `
-            -PasswordNeverExpires
+          $existingUser = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+            Write-Host "RDP user already exists."
+          }
+          else {
+            $password = ConvertTo-SecureString `
+              $env:RDP_PASSWORD `
+              -AsPlainText `
+              -Force
+
+            New-LocalUser `
+              -Name "RDP" `
+              -Password $password `
+              -AccountNeverExpires `
+              -PasswordNeverExpires `
+              -Description "Temporary RDP user"
+
+            Write-Host "RDP user created."
+          }
 
           Add-LocalGroupMember `
-            -Group 'Remote Desktop Users' `
-            -Member 'RDP'
+            -Group "Remote Desktop Users" `
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
 
-          Add-LocalGroupMember `
-            -Group 'Administrators' `
-            -Member 'RDP'
+          Write-Host "RDP user added to Remote Desktop Users."
 
-      - name: Start ngrok TCP tunnel
+      # ==========================================
+      # 4. CHECK TAILSCALE
+      # ==========================================
+      - name: Get Tailscale address
         shell: powershell
         run: |
-          Start-Process `
-            -FilePath "$env:USERPROFILE\ngrok\ngrok.exe" `
-            -ArgumentList 'tcp 3389' `
-            -WindowStyle Hidden
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "TAILSCALE STATUS"
+          Write-Host "=========================================="
 
-          Start-Sleep -Seconds 8
+          & tailscale status
 
-          $tunnel = Invoke-RestMethod `
-            -Uri 'http://127.0.0.1:4040/api/tunnels'
+          $ip = (& tailscale ip -4).Trim()
 
-          $publicUrl = $tunnel.tunnels |
-            Where-Object { $_.proto -eq 'tcp' } |
-            Select-Object -First 1 -ExpandProperty public_url
-
-          if (-not $publicUrl) {
-            Write-Error "ngrok TCP tunnel was not created."
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            Write-Error "Could not obtain Tailscale IPv4 address."
             exit 1
           }
 
           Write-Host ""
-          Write-Host "========================================"
+          Write-Host "=========================================="
           Write-Host "RDP CONNECTION"
-          Write-Host "========================================"
-          Write-Host "Address: $publicUrl"
+          Write-Host "=========================================="
+          Write-Host "Address: $ip"
           Write-Host "Username: RDP"
-          Write-Host "========================================"
+          Write-Host "Password: the value stored in RDP_PASSWORD"
+          Write-Host "=========================================="
           Write-Host ""
 
+      # ==========================================
+      # 5. VERIFY RDP IS LISTENING
+      # ==========================================
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          Write-Host "Checking RDP service..."
+
+          $service = Get-Service -Name TermService
+
+          Write-Host "TermService status: $($service.Status)"
+
+          if ($service.Status -ne "Running") {
+            Write-Error "Remote Desktop service is not running."
+            exit 1
+          }
+
+          Write-Host "Checking TCP port 3389..."
+
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $listener) {
+            Write-Error "Nothing is listening on TCP port 3389."
+            exit 1
+          }
+
+          Write-Host "TCP 3389 is listening."
+
+      # ==========================================
+      # 6. KEEP RUNNER ALIVE
+      # ==========================================
       - name: Keep Windows machine alive
         shell: powershell
         run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "WINDOWS 2022 RDP IS READY"
+          Write-Host "=========================================="
+
+          $ip = (& tailscale ip -4).Trim()
+
+          Write-Host "RDP address : $ip"
+          Write-Host "RDP username: RDP"
+          Write-Host ""
+          Write-Host "Keep this GitHub Actions job running."
+          Write-Host "The Tailscale node will disappear when the job ends."
+          Write-Host "=========================================="
+          Write-Host ""
+
           while ($true) {
-            Write-Host "RDP is running..."
+            Write-Host "RDP is running - $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
             Start-Sleep -Seconds 300
           }
